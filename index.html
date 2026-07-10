@@ -1,0 +1,280 @@
+<!doctype html>
+<!--
+  Gist Runner — a bl.ocks-style output surface for TypeScript gists.
+  ?gist=<id>        run a gist (index.html → web mode, index.ts → node mode)
+  #code=<lz-string> run code embedded in the URL (Playground-compatible encoding)
+  ?bare=1           start with the pill hidden      ?timeout=<ms> watchdog override
+  No code view — the gist is where you read; this page is what the code does.
+  Spec: "Gist Runner - Spec.md". Core logic: runner-core.js (tested in Node).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runner</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  :root { --bg:#0f0f1a; --panel:#1a1a2e; --accent:#22d3ee; --text:#f0f0f0; --muted:#9c9cb8; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text);
+              font:14px/1.45 -apple-system, "Segoe UI", Arial, sans-serif; }
+  #term { position:absolute; inset:0; padding:14px; }
+  #web  { position:absolute; inset:0; border:0; width:100%; height:100%; background:#fff; display:none; }
+  #msg  { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+          text-align:center; padding:2rem; white-space:pre-wrap; color:var(--muted); }
+  /* the pill */
+  #pill { position:fixed; right:14px; bottom:14px; z-index:10; display:flex; gap:.5rem; align-items:center;
+          background:var(--panel); border:1px solid #2a2a44; border-radius:999px; padding:.4rem .8rem;
+          box-shadow:0 4px 14px rgba(0,0,0,.45); font-size:12.5px; }
+  #pill a { color:var(--accent); text-decoration:none; max-width:34ch; overflow:hidden;
+            text-overflow:ellipsis; white-space:nowrap; }
+  #pill a:hover { text-decoration:underline; }
+  #pill button { background:none; border:0; color:var(--muted); cursor:pointer; font-size:12.5px; padding:0 .15rem; }
+  #pill button:hover { color:var(--text); }
+  #pill .dot { color:#3a3a55; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<iframe id="web" sandbox="allow-scripts allow-modals" title="program output"></iframe>
+<div id="msg"></div>
+<div id="pill" hidden>
+  <a id="src" href="#" target="_blank" rel="noopener">source</a>
+  <span class="dot">·</span>
+  <button id="rerun" title="run again">↻ run</button>
+  <span class="dot">·</span>
+  <button id="hide" title="hide">×</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/lz-string@1.5.0/libs/lz-string.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="runner-core.js"></script>
+<script>
+(function () {
+  "use strict";
+  const C = RunnerCore;
+  const qs = new URLSearchParams(location.search);
+  const TIMEOUT = Math.max(1000, parseInt(qs.get("timeout") || "5000", 10) || 5000);
+  const TS_CDN = "https://cdn.jsdelivr.net/npm/typescript@5.5.4/lib/typescript.min.js"; // pinned
+
+  const termEl = document.getElementById("term");
+  const webEl  = document.getElementById("web");
+  const msgEl  = document.getElementById("msg");
+  const pill   = document.getElementById("pill");
+  const srcA   = document.getElementById("src");
+
+  let term = null;
+  function ensureTerm() {
+    if (term) return term;
+    term = new Terminal({
+      convertEol: true, fontSize: 15, cursorBlink: false, disableStdin: true,
+      theme: { background: "#0f0f1a", foreground: "#e9e9f1", cursor: "#22d3ee" },
+    });
+    term.open(termEl);
+    return term;
+  }
+  const CYAN = "\x1b[36m", RED = "\x1b[31m", DIM = "\x1b[2m", RESET = "\x1b[0m";
+  function tline(s, color) { ensureTerm().writeln((color || "") + s + (color ? RESET : "")); }
+  function fatal(s) { msgEl.style.display = "flex"; msgEl.textContent = s; }
+
+  // ---------- load the TS compiler on demand ----------
+  let tsReady = null;
+  function loadTS() {
+    if (tsReady) return tsReady;
+    tsReady = new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = TS_CDN;
+      s.onload = () => res(window.ts);
+      s.onerror = () => rej(new Error("Could not load the TypeScript compiler (CDN unreachable)."));
+      document.head.appendChild(s);
+    });
+    return tsReady;
+  }
+  function makeTranspiler(ts) {
+    return function transpile(name, source) {
+      const out = ts.transpileModule(source, {
+        reportDiagnostics: true,
+        fileName: name,
+        compilerOptions: {
+          module: ts.ModuleKind.ESNext,
+          target: ts.ScriptTarget.ES2020,
+          jsx: ts.JsxEmit.ReactJSX,
+        },
+      });
+      const diagnostics = (out.diagnostics || []).map((d) => {
+        const pos = d.file && d.start !== undefined ? d.file.getLineAndCharacterOfPosition(d.start) : null;
+        const where = pos ? " (line " + (pos.line + 1) + ")" : "";
+        return ts.flattenDiagnosticMessageText(d.messageText, " ") + where;
+      });
+      return { js: out.outputText, diagnostics };
+    };
+  }
+
+  // ---------- source acquisition ----------
+  async function getSource() {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    const frag = hash.get("code");
+    if (frag) {
+      const code = LZString.decompressFromEncodedURIComponent(frag);
+      if (!code) throw new Error("Couldn't decode the #code fragment.");
+      return { files: { "index.ts": code }, meta: { title: "code-in-URL", playground: true } };
+    }
+    const gistId = qs.get("gist");
+    if (!gistId) throw new Error("No program. Use ?gist=<id> or #code=<fragment>.");
+    const res = await fetch("https://api.github.com/gists/" + encodeURIComponent(gistId));
+    if (res.status === 403) {
+      throw new Error("GitHub rate limit reached (60/hr per IP). Try again in a bit, or grade with a token — see README.");
+    }
+    if (!res.ok) throw new Error("Gist fetch failed: HTTP " + res.status);
+    const g = await res.json();
+    const files = {};
+    for (const [name, f] of Object.entries(g.files || {})) files[name] = f.content;
+    return {
+      files,
+      meta: {
+        title: (g.description || "").trim() || Object.keys(files)[0] || "gist",
+        owner: g.owner ? g.owner.login : "anonymous",
+        url: g.html_url,
+      },
+    };
+  }
+
+  // ---------- pill ----------
+  function showPill(meta) {
+    if (qs.get("bare") === "1") return;
+    if (meta.playground) {
+      srcA.textContent = "Open in Playground";
+      srcA.href = "https://www.typescriptlang.org/play/?#code/" +
+        new URLSearchParams(location.hash.slice(1)).get("code");
+    } else {
+      srcA.textContent = (meta.owner ? meta.owner + " / " : "") + meta.title;
+      srcA.href = meta.url;
+    }
+    pill.hidden = false;
+  }
+  document.getElementById("hide").onclick = () => (pill.hidden = true);
+  document.getElementById("rerun").onclick = () => location.reload();
+
+  // ---------- execution ----------
+  let watchdog = null, stdinDepth = 0, iframeAlive = false;
+  function armWatchdog() {
+    clearTimeout(watchdog);
+    if (stdinDepth > 0) return;
+    watchdog = setTimeout(() => {
+      if (!iframeAlive) return;
+      webEl.src = "about:blank";
+      iframeAlive = false;
+      tline("\n[runner] no output for " + TIMEOUT + "ms — stopped. Infinite loop? (?timeout= to raise)", RED);
+    }, TIMEOUT);
+  }
+
+  function bootstrapHtml(entryUrl, gistFiles, argv, webMode, bodyHtml) {
+    // Everything inside the sandboxed (opaque-origin) iframe. Data URLs only — blob: is origin-bound.
+    const setup = `
+      const post = (m) => parent.postMessage(m, "*");
+      const fmt = (a) => { try { return typeof a === "string" ? a : JSON.stringify(a, null, a && typeof a === "object" ? 1 : 0).replace(/\\n\\s*/g, " "); } catch (e) { return String(a); } };
+      for (const k of ["log", "warn", "error", "info"]) {
+        const orig = console[k].bind(console);
+        console[k] = (...args) => { post({ t: "console", k, s: args.map(fmt).join(" ") }); orig(...args); };
+      }
+      globalThis.__stdoutWrite = (s) => post({ t: "stdout", s });
+      globalThis.__stdinOpen  = () => post({ t: "stdin-open" });
+      globalThis.__stdinClose = (q, a) => post({ t: "stdin-close", s: (q || "") + a });
+      globalThis.__gistFiles = ${JSON.stringify(gistFiles).replace(/</g, "\\u003c")};
+      globalThis.__processShim = {
+        argv: ${JSON.stringify(argv).replace(/</g, "\\u003c")}, env: {},
+        exit(code) { post({ t: "exit", code: code || 0 }); throw new Error("__exit__"); },
+        stdout: { write: (s) => post({ t: "stdout", s: String(s) }) },
+      };
+      addEventListener("error", (e) => { if (String(e.message).includes("__exit__")) return; post({ t: "err", s: e.message + (e.lineno ? " (line " + e.lineno + ")" : "") }); });
+      addEventListener("unhandledrejection", (e) => post({ t: "err", s: String(e.reason && e.reason.message || e.reason) }));
+    `;
+    const boot = webMode
+      ? ""
+      : `<script type="module">import(${JSON.stringify(entryUrl)}).then(() => parent.postMessage({ t: "done" }, "*")).catch((e) => parent.postMessage({ t: "err", s: String(e && e.message || e) }, "*"));<\/script>`;
+    return "<!doctype html><html><head><meta charset='utf-8'><script>" + setup + "<\/script></head><body>" +
+      (bodyHtml || "") + boot + "</body></html>";
+  }
+
+  window.addEventListener("message", (ev) => {
+    const m = ev.data || {};
+    if (m.t === "console") tline(m.s, m.k === "error" ? RED : m.k === "warn" ? "\x1b[33m" : "");
+    else if (m.t === "stdout") ensureTerm().write(m.s);
+    else if (m.t === "stdin-open") { stdinDepth++; clearTimeout(watchdog); }
+    else if (m.t === "stdin-close") { stdinDepth = Math.max(0, stdinDepth - 1); tline(CYAN + m.s + RESET); armWatchdog(); }
+    else if (m.t === "err") { tline("✗ " + m.s, RED); armWatchdog(); }
+    else if (m.t === "exit") { tline(DIM + "[exit " + m.code + "]" + RESET); clearTimeout(watchdog); iframeAlive = false; return; }
+    else if (m.t === "done") { tline(DIM + "\n[done]" + RESET); clearTimeout(watchdog); iframeAlive = false; return; }
+    if (m.t === "console" || m.t === "stdout") armWatchdog();
+  });
+
+  async function run() {
+    try {
+      const { files, meta } = await getSource();
+      showPill(meta);
+      const cls = C.classify(files);
+      if (cls.error) return fatal(cls.error);
+
+      const ts = await loadTS();
+      const transpile = makeTranspiler(ts);
+      const argv = ["runner", cls.entry].concat((qs.get("args") || "").split(/\s+/).filter(Boolean));
+
+      if (cls.mode === "node") {
+        ensureTerm();
+        const graph = C.buildGraph(files, cls.entry, transpile);
+        (graph.diagnostics || []).forEach((d) => tline("⚠ " + d, "\x1b[33m"));
+        if (graph.error) return tline("✗ " + graph.error, RED);
+
+        // leaves-first: finalize each module, hand out data: URLs
+        const urls = {};
+        const urlOf = (key) => {
+          if (key.startsWith("__shim__:")) {
+            const s = key.slice(9);
+            if (!urls[key]) urls[key] = C.toDataUrl(C.SHIMS[s]);
+          } else if (key.startsWith("__nodeerr__:")) {
+            if (!urls[key]) urls[key] = C.toDataUrl(C.nodeErrorModule(key.slice(12)));
+          }
+          return urls[key];
+        };
+        for (const mod of graph.order) {
+          const finalJs = C.finalizeModule(mod.js, files, (k) => urlOf(k) || urls[k]);
+          urls[mod.name] = C.toDataUrl(finalJs);
+        }
+        webEl.style.display = "none";
+        termEl.style.display = "block";
+        webEl.srcdoc = bootstrapHtml(urls[cls.entry], files, argv, false, "");
+        iframeAlive = true;
+        armWatchdog();
+      } else {
+        // web mode
+        const runnables = Object.keys(files).filter(C.isRunnable);
+        const urls = {};
+        const urlOf = (key) => {
+          if (key.startsWith("__shim__:")) return (urls[key] = urls[key] || C.toDataUrl(C.SHIMS[key.slice(9)]));
+          if (key.startsWith("__nodeerr__:")) return (urls[key] = urls[key] || C.toDataUrl(C.nodeErrorModule(key.slice(12))));
+          return urls[key];
+        };
+        for (const name of runnables) {
+          const graph = C.buildGraph(files, name, transpile);
+          if (graph.error) return fatal(graph.error);
+          for (const mod of graph.order) {
+            if (urls[mod.name]) continue;
+            urls[mod.name] = C.toDataUrl(C.finalizeModule(mod.js, files, (k) => urlOf(k) || urls[k]));
+          }
+        }
+        const html = C.rewriteHtml(files[cls.entry], files, (k) => urls[k]);
+        termEl.style.display = "none";
+        webEl.style.display = "block";
+        webEl.srcdoc = bootstrapHtml(null, files, argv, true, html);
+        iframeAlive = true;
+        // web pages are long-lived; no watchdog in web mode
+      }
+    } catch (e) {
+      fatal(String((e && e.message) || e));
+    }
+  }
+
+  run();
+})();
+</script>
+</body>
+</html>
